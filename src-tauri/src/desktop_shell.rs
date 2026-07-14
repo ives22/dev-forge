@@ -33,6 +33,7 @@ struct MainWindowSnapshot {
 #[derive(Debug, Default)]
 struct DesktopShellState {
     mode: MainWindowMode,
+    launcher_target: Option<MonitorFrame>,
     transient_snapshot: Option<MainWindowSnapshot>,
 }
 
@@ -59,6 +60,43 @@ impl DesktopShellState {
     fn should_hide_on_app_deactivate(&self) -> bool {
         self.mode == MainWindowMode::Transient
     }
+
+    fn set_launcher_target(&mut self, target: Option<MonitorFrame>) {
+        self.launcher_target = target;
+    }
+
+    fn launcher_target(&self) -> Option<MonitorFrame> {
+        self.launcher_target
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launcher_activation_options() -> NSApplicationActivationOptions {
+    NSApplicationActivationOptions::empty()
+}
+
+#[cfg(target_os = "macos")]
+fn transient_main_collection_behavior(
+    mut behavior: NSWindowCollectionBehavior,
+) -> NSWindowCollectionBehavior {
+    behavior.remove(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Primary
+            | NSWindowCollectionBehavior::CanJoinAllApplications
+            | NSWindowCollectionBehavior::Managed
+            | NSWindowCollectionBehavior::Transient
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::FullScreenPrimary
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+            | NSWindowCollectionBehavior::FullScreenNone,
+    );
+    behavior.insert(
+        NSWindowCollectionBehavior::MoveToActiveSpace
+            | NSWindowCollectionBehavior::Auxiliary
+            | NSWindowCollectionBehavior::Transient
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    behavior
 }
 
 fn select_target_monitor(
@@ -160,6 +198,16 @@ mod tests {
     }
 
     #[test]
+    fn remembers_the_monitor_that_triggered_the_launcher() {
+        let expected = frame(-1920.0, 0.0, 1920.0, 1080.0);
+        let mut state = DesktopShellState::default();
+
+        state.set_launcher_target(Some(expected));
+
+        assert_eq!(state.launcher_target(), Some(expected));
+    }
+
+    #[test]
     fn target_monitor_prefers_a_valid_shortcut_screen() {
         let preferred = frame(-1920.0, 0.0, 1920.0, 1080.0);
         let primary = frame(0.0, 0.0, 2560.0, 1440.0);
@@ -208,4 +256,34 @@ mod tests {
             }
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launcher_activation_does_not_bring_all_app_windows_forward() {
+        let options = launcher_activation_options();
+
+        assert!(!options.contains(NSApplicationActivationOptions::ActivateAllWindows));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transient_main_window_moves_to_the_active_fullscreen_space() {
+        let initial = NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Managed
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::FullScreenPrimary;
+
+        let behavior = transient_main_collection_behavior(initial);
+
+        assert!(behavior.contains(NSWindowCollectionBehavior::MoveToActiveSpace));
+        assert!(behavior.contains(NSWindowCollectionBehavior::Auxiliary));
+        assert!(behavior.contains(NSWindowCollectionBehavior::Transient));
+        assert!(behavior.contains(NSWindowCollectionBehavior::FullScreenAuxiliary));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::Managed));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::Stationary));
+        assert!(!behavior.contains(NSWindowCollectionBehavior::FullScreenPrimary));
+    }
 }
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSApplicationActivationOptions, NSWindowCollectionBehavior};
