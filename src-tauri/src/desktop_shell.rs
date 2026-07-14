@@ -75,8 +75,12 @@ impl DesktopShellState {
     }
 
     fn enter_persistent(&mut self) -> Option<MainWindowSnapshot> {
-        self.mode = MainWindowMode::Persistent;
-        self.transient_snapshot.take()
+        if self.mode == MainWindowMode::Transient {
+            self.transient_snapshot
+        } else {
+            self.mode = MainWindowMode::Persistent;
+            None
+        }
     }
 
     fn enter_transient(&mut self, snapshot: MainWindowSnapshot) {
@@ -85,8 +89,18 @@ impl DesktopShellState {
     }
 
     fn hide(&mut self) -> Option<MainWindowSnapshot> {
-        self.mode = MainWindowMode::Hidden;
-        self.transient_snapshot.take()
+        if self.mode == MainWindowMode::Transient {
+            self.transient_snapshot
+        } else {
+            self.mode = MainWindowMode::Hidden;
+            None
+        }
+    }
+
+    fn complete_restore(&mut self, mode: MainWindowMode) {
+        debug_assert_ne!(mode, MainWindowMode::Transient);
+        self.mode = mode;
+        self.transient_snapshot = None;
     }
 
     fn should_hide_on_app_deactivate(&self) -> bool {
@@ -444,6 +458,9 @@ fn show_persistent_main_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> Result
     };
     if let Some(snapshot) = update_shell_state(app, DesktopShellState::enter_persistent)? {
         restore_main_window_snapshot(&window, snapshot)?;
+        update_shell_state(app, |state| {
+            state.complete_restore(MainWindowMode::Persistent)
+        })?;
     }
     set_regular_activation_policy(app);
     window.show().map_err(|error| error.to_string())?;
@@ -465,10 +482,10 @@ fn show_transient_main_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> Result<
         height: snapshot.frame.height,
     });
 
+    update_shell_state(app, |state| state.enter_transient(snapshot))?;
     let configure_result = (|| {
         configure_transient_main_window(&window)?;
         position_window_on_monitor(&window, target, snapshot.frame.width, snapshot.frame.height)?;
-        update_shell_state(app, |state| state.enter_transient(snapshot))?;
         set_accessory_activation_policy(app);
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;
@@ -477,8 +494,12 @@ fn show_transient_main_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> Result<
 
     if let Err(error) = configure_result {
         let _ = window.hide();
-        let _ = restore_main_window_snapshot(&window, snapshot);
-        let _ = update_shell_state(app, DesktopShellState::hide);
+        if let Err(restore_error) = restore_main_window_snapshot(&window, snapshot) {
+            return Err(format!(
+                "{error}; restore main window after transient setup failure: {restore_error}"
+            ));
+        }
+        update_shell_state(app, |state| state.complete_restore(MainWindowMode::Hidden))?;
         return Err(error);
     }
     Ok(())
@@ -493,6 +514,7 @@ fn hide_main_window_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> Result<(),
     let snapshot = update_shell_state(app, DesktopShellState::hide)?;
     if let Some(snapshot) = snapshot {
         restore_main_window_snapshot(&window, snapshot)?;
+        update_shell_state(app, |state| state.complete_restore(MainWindowMode::Hidden))?;
     }
     set_accessory_activation_policy(app);
     Ok(())
@@ -509,7 +531,7 @@ fn capture_main_window_snapshot<R: Runtime>(
     #[cfg(target_os = "macos")]
     {
         let ns_window = window.ns_window().map_err(|error| error.to_string())?;
-        return run_appkit_step("capture main window snapshot", || unsafe {
+        run_appkit_step("capture main window snapshot", || unsafe {
             let ns_window = &*(ns_window.cast::<NSWindow>());
             let frame = ns_window.frame();
             MainWindowSnapshot {
@@ -523,7 +545,7 @@ fn capture_main_window_snapshot<R: Runtime>(
                 collection_behavior: ns_window.collectionBehavior().bits() as u64,
                 level: ns_window.level() as i64,
             }
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -691,7 +713,7 @@ fn position_window_on_monitor<R: Runtime>(
     #[cfg(target_os = "macos")]
     {
         let ns_window = window.ns_window().map_err(|error| error.to_string())?;
-        return run_appkit_step("position desktop window", || unsafe {
+        run_appkit_step("position desktop window", || unsafe {
             let ns_window = &*(ns_window.cast::<NSWindow>());
             ns_window.setFrame_display(
                 NSRect::new(
@@ -700,7 +722,7 @@ fn position_window_on_monitor<R: Runtime>(
                 ),
                 true,
             );
-        });
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -729,13 +751,13 @@ fn resolve_target_monitor<R: Runtime>(
     #[cfg(target_os = "macos")]
     {
         let available = available_monitor_frames_macos();
-        return select_target_monitor(
+        select_target_monitor(
             preferred,
             &available,
             cursor_monitor_frame_macos(),
             window_monitor_frame_macos(window),
             primary_monitor_frame_macos(),
-        );
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1001,7 +1023,20 @@ mod tests {
         assert_eq!(state.mode(), MainWindowMode::Transient);
         assert!(state.should_hide_on_app_deactivate());
         assert_eq!(state.hide(), Some(expected_snapshot));
+        state.complete_restore(MainWindowMode::Hidden);
         assert_eq!(state.mode(), MainWindowMode::Hidden);
+    }
+
+    #[test]
+    fn transient_hide_keeps_snapshot_until_restore_succeeds() {
+        let expected_snapshot = snapshot();
+        let mut state = DesktopShellState::default();
+        state.enter_transient(expected_snapshot);
+
+        assert_eq!(state.hide(), Some(expected_snapshot));
+
+        assert_eq!(state.mode(), MainWindowMode::Transient);
+        assert_eq!(state.hide(), Some(expected_snapshot));
     }
 
     #[test]
@@ -1046,6 +1081,11 @@ mod tests {
         state.enter_transient(expected_snapshot);
 
         assert_eq!(state.enter_persistent(), Some(expected_snapshot));
+        assert_eq!(state.mode(), MainWindowMode::Transient);
+
+        state.complete_restore(MainWindowMode::Persistent);
+
+        assert_eq!(state.enter_persistent(), None);
         assert_eq!(state.mode(), MainWindowMode::Persistent);
     }
 

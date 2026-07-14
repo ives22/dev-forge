@@ -17,7 +17,7 @@ base64 = "0.22"
 block2 = "0.6.2"
 fancy-regex = "0.18"
 objc2 = { version = "0.6.4", features = ["exception"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSScreen", "NSWindow"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSResponder", "NSScreen", "NSWindow"] }
 objc2-core-foundation = { version = "0.3.2", features = ["CFString"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSGeometry", "NSNotification", "NSOperation", "NSString", "block2", "objc2-core-foundation"] }
 serde = { version = "1", features = ["derive"] }
