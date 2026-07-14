@@ -7,8 +7,11 @@ import { resetStorageFallbacksForTests } from "./lib/storage";
 const mocks = vi.hoisted(() => {
   const savedFiles: Array<{ defaultPath: string; value: string }> = [];
   const clipboardWriteText = vi.fn(async (_value: string) => undefined);
+  const desktopEventCleanup = vi.fn();
   return {
     clipboardWriteText,
+    desktopEventCleanup,
+    listenForDesktopEvents: vi.fn(async () => desktopEventCleanup),
     copyText: vi.fn(async (value: string) => {
       await clipboardWriteText(value);
     }),
@@ -51,6 +54,7 @@ vi.mock("./lib/desktop", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./lib/desktop")>();
   return {
     ...actual,
+    listenForDesktopEvents: mocks.listenForDesktopEvents,
     copyText: mocks.copyText,
     captureScreenSelection: mocks.captureScreenSelection,
     getLocalNetworkIp: mocks.getLocalNetworkIp,
@@ -176,11 +180,34 @@ beforeEach(() => {
 afterEach(() => {
   resetStorageFallbacksForTests();
   mocks.clipboardWriteText.mockClear();
+  mocks.desktopEventCleanup.mockClear();
+  mocks.listenForDesktopEvents.mockReset();
+  mocks.listenForDesktopEvents.mockResolvedValue(mocks.desktopEventCleanup);
   window.localStorage.clear();
+  Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   vi.unstubAllGlobals();
 });
 
 describe("App shell", () => {
+  it("unsubscribes desktop events when the main window unmounts", async () => {
+    const { unmount } = render(<App />);
+    await waitFor(() => expect(mocks.listenForDesktopEvents).toHaveBeenCalledTimes(1));
+
+    unmount();
+
+    await waitFor(() => expect(mocks.desktopEventCleanup).toHaveBeenCalledTimes(1));
+  });
+
+  it("unsubscribes desktop events when the launcher window unmounts", async () => {
+    window.history.replaceState(null, "", "/?window=launcher");
+    const { unmount } = render(<App />);
+    await waitFor(() => expect(mocks.listenForDesktopEvents).toHaveBeenCalledTimes(1));
+
+    unmount();
+
+    await waitFor(() => expect(mocks.desktopEventCleanup).toHaveBeenCalledTimes(1));
+  });
+
   it("renders dashboard and navigates to Base64", async () => {
     const user = setupUser();
     render(<App />);

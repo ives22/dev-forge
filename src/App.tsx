@@ -171,10 +171,22 @@ function RoutedApp() {
   }, [activeRoute]);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
     void listenForDesktopEvents({
       openCommandPalette: () => setPaletteOpen(true),
       openTool
+    }).then((cleanup) => {
+      if (disposed) {
+        cleanup();
+      } else {
+        unlisten = cleanup;
+      }
     });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -258,6 +270,8 @@ function LauncherApp() {
   const [focusRequest, setFocusRequest] = useState(0);
 
   useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
     const focusLauncher = () => {
       setOpen(true);
       setFocusRequest((current) => current + 1);
@@ -267,8 +281,18 @@ function LauncherApp() {
       openCommandPalette: focusLauncher,
       openTool: () => undefined,
       focusLauncher
+    }).then((cleanup) => {
+      if (disposed) {
+        cleanup();
+      } else {
+        unlisten = cleanup;
+      }
     });
-    return () => window.removeEventListener("devforge:focus-launcher", focusLauncher);
+    return () => {
+      disposed = true;
+      unlisten?.();
+      window.removeEventListener("devforge:focus-launcher", focusLauncher);
+    };
   }, []);
 
   const close = () => {
