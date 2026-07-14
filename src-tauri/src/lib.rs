@@ -1,3 +1,5 @@
+mod desktop_shell;
+
 use base64::{engine::general_purpose, Engine as _};
 use fancy_regex::{Regex, RegexBuilder};
 #[cfg(target_os = "macos")]
