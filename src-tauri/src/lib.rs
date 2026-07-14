@@ -3,20 +3,10 @@ mod desktop_shell;
 use base64::{engine::general_purpose, Engine as _};
 use fancy_regex::{Regex, RegexBuilder};
 #[cfg(target_os = "macos")]
-use objc2::{exception, runtime::AnyObject, MainThreadMarker};
-#[cfg(target_os = "macos")]
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSEvent,
-    NSPopUpMenuWindowLevel, NSRunningApplication, NSScreen, NSWindow, NSWindowAnimationBehavior,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
-};
-#[cfg(target_os = "macos")]
 use objc2_core_foundation::{
     kCFStringTransformMandarinLatin, kCFStringTransformStripCombiningMarks, CFMutableString,
     CFRange, CFString,
 };
-#[cfg(target_os = "macos")]
-use objc2_foundation::{NSPoint, NSPointInRect, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -25,16 +15,9 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
-};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri::{AppHandle, Emitter, Runtime};
 
 const DB_URL: &str = "sqlite:devforge.db";
 const DNS_PORT: u16 = 53;
@@ -42,21 +25,6 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const FALLBACK_DNS_RESOLVERS: [&str; 2] = ["1.1.1.1", "8.8.8.8"];
 const REGEX_MAX_MATCHES: usize = 1000;
 const APPLICATION_RESULT_LIMIT: usize = 50;
-const LAUNCHER_WINDOW_LABEL: &str = "launcher";
-const LAUNCHER_WINDOW_WIDTH: f64 = 780.0;
-const LAUNCHER_WINDOW_HEIGHT: f64 = 490.0;
-const LAUNCHER_WINDOW_MIN_WIDTH: f64 = 560.0;
-const LAUNCHER_WINDOW_MIN_HEIGHT: f64 = 360.0;
-const MAIN_WINDOW_REOPEN_SUPPRESS_DURATION: Duration = Duration::from_secs(2);
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct LauncherMonitorFrame {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageEntry {
     pub tool_id: String,
@@ -196,35 +164,6 @@ pub struct RegexResult {
     pub engine: String,
 }
 
-#[derive(Debug, Default)]
-struct MainWindowReopenGuard {
-    suppress_until: Mutex<Option<Instant>>,
-}
-
-impl MainWindowReopenGuard {
-    fn suppress_for(&self, duration: Duration) {
-        let Ok(mut suppress_until) = self.suppress_until.lock() else {
-            return;
-        };
-        *suppress_until = Some(Instant::now() + duration);
-    }
-
-    fn consume_if_active(&self) -> bool {
-        self.consume_if_active_at(Instant::now())
-    }
-
-    fn consume_if_active_at(&self, now: Instant) -> bool {
-        let Ok(mut suppress_until) = self.suppress_until.lock() else {
-            return false;
-        };
-        let Some(deadline) = *suppress_until else {
-            return false;
-        };
-        *suppress_until = None;
-        now <= deadline
-    }
-}
-
 #[tauri::command]
 fn database_url() -> &'static str {
     DB_URL
@@ -248,12 +187,12 @@ async fn emit_command_palette<R: Runtime>(app: AppHandle<R>) -> Result<(), Strin
 
 #[tauri::command]
 async fn show_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    show_launcher_window(&app)
+    desktop_shell::show_launcher(&app)
 }
 
 #[tauri::command]
 async fn hide_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    hide_launcher_window(&app)
+    desktop_shell::hide_launcher(&app)
 }
 
 #[tauri::command]
@@ -261,10 +200,7 @@ async fn open_tool_from_launcher<R: Runtime>(
     app: AppHandle<R>,
     tool_id: String,
 ) -> Result<(), String> {
-    hide_launcher_window(&app)?;
-    show_main_window(&app);
-    app.emit("devforge://open-tool", tool_id)
-        .map_err(|error| error.to_string())
+    desktop_shell::open_tool_from_launcher(&app, tool_id)
 }
 
 #[tauri::command]
@@ -282,9 +218,8 @@ async fn open_application<R: Runtime>(app: AppHandle<R>, path: String) -> Result
     if !is_application_bundle(&path) {
         return Err("只能打开 .app 应用".to_string());
     }
-    hide_launcher_window(&app)?;
-    app.state::<MainWindowReopenGuard>()
-        .suppress_for(MAIN_WINDOW_REOPEN_SUPPRESS_DURATION);
+    desktop_shell::hide_launcher(&app)?;
+    desktop_shell::suppress_next_reopen(&app);
     Command::new("open")
         .arg(&path)
         .spawn()
@@ -2483,518 +2418,17 @@ fn classify_process(process: &str, port: u16) -> String {
     "app".to_string()
 }
 
-fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show DevForge", true, None::<&str>)?;
-    let command = MenuItem::with_id(app, "command", "Open Launcher", true, None::<&str>)?;
-    let dashboard = MenuItem::with_id(app, "dashboard", "Dashboard", true, None::<&str>)?;
-    let json = MenuItem::with_id(app, "json-yaml", "JSON / YAML", true, None::<&str>)?;
-    let base64 = MenuItem::with_id(app, "base64", "Base64", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &command, &dashboard, &json, &base64, &quit])?;
-
-    TrayIconBuilder::new()
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main_window(app),
-            "command" => {
-                let _ = show_launcher_window(app);
-            }
-            "dashboard" | "json-yaml" | "base64" => {
-                show_main_window(app);
-                let _ = app.emit("devforge://open-tool", event.id.as_ref());
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
-            }
-        })
-        .build(app)?;
-
-    Ok(())
-}
-
-fn setup_launcher_window<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
-    let launcher = WebviewWindowBuilder::new(
-        app,
-        LAUNCHER_WINDOW_LABEL,
-        WebviewUrl::App("index.html?window=launcher".into()),
-    )
-    .title("DevForge Launcher")
-    .inner_size(LAUNCHER_WINDOW_WIDTH, LAUNCHER_WINDOW_HEIGHT)
-    .min_inner_size(LAUNCHER_WINDOW_MIN_WIDTH, LAUNCHER_WINDOW_MIN_HEIGHT)
-    .resizable(false)
-    .decorations(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .visible_on_all_workspaces(true)
-    .visible(false)
-    .center()
-    .build()?;
-
-    let launcher_for_focus = launcher.clone();
-    launcher.on_window_event(move |event| {
-        if let WindowEvent::Focused(false) = event {
-            let _ = launcher_for_focus.hide();
-        }
-    });
-
-    Ok(())
-}
-
-fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
-    restore_regular_activation_policy();
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
-}
-
-fn show_launcher_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let app = app.clone();
-    app.clone()
-        .run_on_main_thread(move || {
-            if let Err(error) = show_launcher_window_on_main_thread(&app) {
-                log_launcher_debug(format!("show launcher failed: {error}"));
-            }
-        })
-        .map_err(|error| error.to_string())
-}
-
-fn show_launcher_window_on_main_thread<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) else {
-        return Err("启动器窗口不存在".to_string());
-    };
-    prepare_launcher_activation_policy();
-    configure_launcher_workspace_behavior(&window);
-    window
-        .set_min_size(Some(tauri::Size::Logical(tauri::LogicalSize {
-            width: LAUNCHER_WINDOW_MIN_WIDTH,
-            height: LAUNCHER_WINDOW_MIN_HEIGHT,
-        })))
-        .map_err(|error| error.to_string())?;
-    window
-        .set_size(tauri::Size::Logical(tauri::LogicalSize {
-            width: LAUNCHER_WINDOW_WIDTH,
-            height: LAUNCHER_WINDOW_HEIGHT,
-        }))
-        .map_err(|error| error.to_string())?;
-    position_launcher_window(app, &window)?;
-    #[cfg(target_os = "macos")]
-    show_and_front_launcher_window_macos(&window).map_err(|error| error.to_string())?;
-    #[cfg(not(target_os = "macos"))]
-    {
-        window.show().map_err(|error| error.to_string())?;
-        window.unminimize().map_err(|error| error.to_string())?;
-        window.set_focus().map_err(|error| error.to_string())?;
-    }
-    app.emit("devforge://focus-launcher", ())
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn configure_launcher_workspace_behavior<R: Runtime>(window: &WebviewWindow<R>) {
-    if let Err(error) = window.set_visible_on_all_workspaces(true) {
-        log_launcher_debug(format!("set_visible_on_all_workspaces failed: {error}"));
-    }
-    if let Err(error) = configure_launcher_fullscreen_auxiliary(window) {
-        log_launcher_debug(format!("configure fullscreen auxiliary failed: {error}"));
-    }
-    if let Err(error) = window.set_focusable(true) {
-        log_launcher_debug(format!("set launcher focusable failed: {error}"));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn configure_launcher_fullscreen_auxiliary<R: Runtime>(
-    window: &WebviewWindow<R>,
-) -> tauri::Result<()> {
-    let ns_window = window.ns_window()?;
-    run_appkit_launcher_step("configure fullscreen auxiliary", || unsafe {
-        let ns_window = &*(ns_window.cast::<NSWindow>());
-        ns_window.setCollectionBehavior(launcher_fullscreen_collection_behavior(
-            ns_window.collectionBehavior(),
-        ));
-        ns_window.setStyleMask(launcher_floating_panel_style_mask(ns_window.styleMask()));
-        ns_window.setHidesOnDeactivate(false);
-        ns_window.setCanHide(false);
-        ns_window.setAnimationBehavior(NSWindowAnimationBehavior::UtilityWindow);
-        ns_window.setLevel(NSPopUpMenuWindowLevel);
-    })?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn configure_launcher_fullscreen_auxiliary<R: Runtime>(
-    _window: &WebviewWindow<R>,
-) -> tauri::Result<()> {
-    Ok(())
-}
-
-fn position_launcher_window<R: Runtime>(
-    app: &AppHandle<R>,
-    window: &WebviewWindow<R>,
-) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = app;
-        position_launcher_window_macos(window).map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if let Some(frame) = launcher_monitor_frame(app, window)? {
-            let position = launcher_position_for_monitor_frame(
-                frame,
-                LAUNCHER_WINDOW_WIDTH,
-                LAUNCHER_WINDOW_HEIGHT,
-            );
-            window
-                .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
-                    position.x.round() as i32,
-                    position.y.round() as i32,
-                )))
-                .map_err(|error| error.to_string())?;
-        } else {
-            window.center().map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn position_launcher_window_macos<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
-    let ns_window = window.ns_window()?;
-    run_appkit_launcher_step("position launcher", || unsafe {
-        let ns_window = &*(ns_window.cast::<NSWindow>());
-        let mouse_location = NSEvent::mouseLocation();
-        let screen_frame = launcher_screen_frame_for_mouse(mouse_location)
-            .or_else(launcher_main_screen_frame)
-            .unwrap_or(LauncherMonitorFrame {
-                x: 0.0,
-                y: 0.0,
-                width: LAUNCHER_WINDOW_WIDTH,
-                height: LAUNCHER_WINDOW_HEIGHT,
-            });
-        let window_frame = launcher_position_for_monitor_frame(
-            screen_frame,
-            LAUNCHER_WINDOW_WIDTH,
-            LAUNCHER_WINDOW_HEIGHT,
-        );
-        let frame = NSRect::new(
-            NSPoint::new(window_frame.x, window_frame.y),
-            NSSize::new(LAUNCHER_WINDOW_WIDTH, LAUNCHER_WINDOW_HEIGHT),
-        );
-
-        if launcher_debug_enabled() {
-            eprintln!(
-                "devforge launcher: mouse=({}, {}), screen=({}, {}, {}, {}), frame=({}, {}, {}, {}), behavior={:?}, level={}",
-                mouse_location.x,
-                mouse_location.y,
-                screen_frame.x,
-                screen_frame.y,
-                screen_frame.width,
-                screen_frame.height,
-                frame.origin.x,
-                frame.origin.y,
-                frame.size.width,
-                frame.size.height,
-                ns_window.collectionBehavior(),
-                ns_window.level(),
-            );
-        }
-
-        ns_window.setFrame_display(frame, true);
-    })?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn launcher_fullscreen_collection_behavior(
-    mut behavior: NSWindowCollectionBehavior,
-) -> NSWindowCollectionBehavior {
-    behavior.remove(
-        NSWindowCollectionBehavior::Primary
-            | NSWindowCollectionBehavior::Auxiliary
-            | NSWindowCollectionBehavior::CanJoinAllApplications
-            | NSWindowCollectionBehavior::Managed
-            | NSWindowCollectionBehavior::Transient
-            | NSWindowCollectionBehavior::Stationary
-            | NSWindowCollectionBehavior::FullScreenPrimary
-            | NSWindowCollectionBehavior::FullScreenAuxiliary
-            | NSWindowCollectionBehavior::FullScreenNone,
-    );
-    behavior.insert(
-        NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::Auxiliary
-            | NSWindowCollectionBehavior::FullScreenAuxiliary
-            | NSWindowCollectionBehavior::Transient,
-    );
-    behavior
-}
-
-#[cfg(target_os = "macos")]
-fn launcher_floating_panel_style_mask(mut style_mask: NSWindowStyleMask) -> NSWindowStyleMask {
-    style_mask.insert(NSWindowStyleMask::UtilityWindow);
-    style_mask.remove(NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::Miniaturizable);
-    style_mask
-}
-
-#[cfg(target_os = "macos")]
-fn show_and_front_launcher_window_macos<R: Runtime>(
-    window: &WebviewWindow<R>,
-) -> tauri::Result<()> {
-    let ns_window = window.ns_window()?;
-    run_appkit_launcher_step("show and front launcher", || unsafe {
-        let ns_window = &*(ns_window.cast::<NSWindow>());
-        if ns_window.isMiniaturized() {
-            ns_window.deminiaturize(None::<&AnyObject>);
-        }
-        ns_window.orderFrontRegardless();
-        activate_current_macos_app();
-        if ns_window.canBecomeKeyWindow() {
-            ns_window.makeKeyWindow();
-        }
-        if ns_window.canBecomeMainWindow() {
-            ns_window.makeMainWindow();
-        }
-        ns_window.makeKeyAndOrderFront(None::<&AnyObject>);
-        ns_window.orderFrontRegardless();
-        if launcher_debug_enabled() {
-            eprintln!(
-                "devforge launcher: shown on active space={}, visible={}, key={}, main={}, can_key={}, can_main={}, miniaturized={}, behavior={:?}, level={}",
-                ns_window.isOnActiveSpace(),
-                ns_window.isVisible(),
-                ns_window.isKeyWindow(),
-                ns_window.isMainWindow(),
-                ns_window.canBecomeKeyWindow(),
-                ns_window.canBecomeMainWindow(),
-                ns_window.isMiniaturized(),
-                ns_window.collectionBehavior(),
-                ns_window.level(),
-            );
-        }
-    })?;
-    if let Err(error) = window.set_focus() {
-        log_launcher_debug(format!("set launcher window focus failed: {error}"));
-    }
-    if let Err(error) = window.as_ref().set_focus() {
-        log_launcher_debug(format!("set launcher webview focus failed: {error}"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn activate_current_macos_app() {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    app.activate();
-    #[allow(deprecated)]
-    app.activateIgnoringOtherApps(true);
-    let running_app = NSRunningApplication::currentApplication();
-    if !running_app.activateWithOptions(launcher_activation_options()) {
-        log_launcher_debug("activate current application returned false");
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn launcher_activation_options() -> NSApplicationActivationOptions {
-    let mut options = NSApplicationActivationOptions::ActivateAllWindows;
-    #[allow(deprecated)]
-    options.insert(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
-    options
-}
-
-#[cfg(target_os = "macos")]
-fn prepare_launcher_activation_policy() {
-    set_macos_activation_policy(
-        NSApplicationActivationPolicy::Accessory,
-        "set launcher activation policy",
-    );
-}
-
-#[cfg(not(target_os = "macos"))]
-fn prepare_launcher_activation_policy() {}
-
-#[cfg(target_os = "macos")]
-fn restore_regular_activation_policy() {
-    set_macos_activation_policy(
-        NSApplicationActivationPolicy::Regular,
-        "restore regular activation policy",
-    );
-}
-
-#[cfg(not(target_os = "macos"))]
-fn restore_regular_activation_policy() {}
-
-#[cfg(target_os = "macos")]
-fn set_macos_activation_policy(policy: NSApplicationActivationPolicy, label: &'static str) {
-    if let Err(error) = run_appkit_launcher_step(label, || {
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let app = NSApplication::sharedApplication(mtm);
-        if !app.setActivationPolicy(policy) {
-            log_launcher_debug(format!("{label} returned false"));
-        }
-    }) {
-        log_launcher_debug(format!("{label} failed: {error}"));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn run_appkit_launcher_step(
-    label: &str,
-    step: impl FnOnce() + std::panic::UnwindSafe,
-) -> tauri::Result<()> {
-    exception::catch(step).map_err(|exception| {
-        let detail = exception
-            .as_deref()
-            .map(|exception| format!("{exception:?}"))
-            .unwrap_or_else(|| "nil Objective-C exception".to_string());
-        let message = format!("{label} raised Objective-C exception: {detail}");
-        log_launcher_debug(&message);
-        tauri::Error::Io(std::io::Error::other(message))
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn launcher_screen_frame_for_mouse(mouse_location: NSPoint) -> Option<LauncherMonitorFrame> {
-    let mtm = MainThreadMarker::new()?;
-    let screens = NSScreen::screens(mtm);
-    for screen in screens.iter() {
-        let frame = screen.frame();
-        if NSPointInRect(mouse_location, frame) {
-            return Some(launcher_monitor_frame_from_ns_rect(frame));
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn launcher_main_screen_frame() -> Option<LauncherMonitorFrame> {
-    let mtm = MainThreadMarker::new()?;
-    NSScreen::mainScreen(mtm).map(|screen| launcher_monitor_frame_from_ns_rect(screen.frame()))
-}
-
-#[cfg(target_os = "macos")]
-fn launcher_monitor_frame_from_ns_rect(frame: NSRect) -> LauncherMonitorFrame {
-    LauncherMonitorFrame {
-        x: frame.origin.x,
-        y: frame.origin.y,
-        width: frame.size.width,
-        height: frame.size.height,
-    }
-}
-
-fn launcher_debug_enabled() -> bool {
-    std::env::var("DEVFORGE_LAUNCHER_DEBUG").is_ok_and(|value| value != "0")
-}
-
-fn log_launcher_debug(message: impl AsRef<str>) {
-    if launcher_debug_enabled() {
-        eprintln!("devforge launcher: {}", message.as_ref());
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn launcher_monitor_frame<R: Runtime>(
-    app: &AppHandle<R>,
-    window: &WebviewWindow<R>,
-) -> Result<Option<LauncherMonitorFrame>, String> {
-    let cursor_monitor = app
-        .cursor_position()
-        .ok()
-        .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten());
-    let monitor = cursor_monitor
-        .or_else(|| window.current_monitor().ok().flatten())
-        .or_else(|| app.primary_monitor().ok().flatten());
-
-    Ok(monitor.map(|monitor| {
-        let position = monitor.position();
-        let size = monitor.size();
-        LauncherMonitorFrame {
-            x: f64::from(position.x),
-            y: f64::from(position.y),
-            width: f64::from(size.width),
-            height: f64::from(size.height),
-        }
-    }))
-}
-
-fn launcher_position_for_monitor_frame(
-    frame: LauncherMonitorFrame,
-    window_width: f64,
-    window_height: f64,
-) -> tauri::LogicalPosition<f64> {
-    let window_width = window_width.max(1.0);
-    let window_height = window_height.max(1.0);
-    let available_x = (frame.width - window_width).max(0.0);
-    let available_y = (frame.height - window_height).max(0.0);
-    let centered_x = frame.x + ((frame.width - window_width) / 2.0);
-    let centered_y = frame.y + ((frame.height - window_height) / 2.0);
-    let min_x = frame.x;
-    let min_y = frame.y;
-    let max_x = frame.x + available_x;
-    let max_y = frame.y + available_y;
-
-    tauri::LogicalPosition::new(
-        centered_x.clamp(min_x, max_x),
-        centered_y.clamp(min_y, max_y),
-    )
-}
-
-fn hide_launcher_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW_LABEL) {
-        window.hide().map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-fn request_show_launcher_window<R: Runtime + 'static>(app: AppHandle<R>) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = show_launcher_window(&app) {
-            log_launcher_debug(format!("queue show launcher failed: {error}"));
-        }
-    });
-}
-
-fn setup_global_shortcut<R: Runtime + 'static>(app: &tauri::App<R>) -> Result<(), String> {
-    let shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
-    let handle = app.handle().clone();
-    app.global_shortcut()
-        .on_shortcut(shortcut, move |_app, _shortcut, event| {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if event.state() == ShortcutState::Pressed {
-                    request_show_launcher_window(handle.clone());
-                }
-            }));
-            if result.is_err() {
-                log_launcher_debug("global shortcut handler panicked");
-            }
-        })
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_window_state::Builder::default()
-                .skip_initial_state(LAUNCHER_WINDOW_LABEL)
-                .with_filter(|label| label != LAUNCHER_WINDOW_LABEL)
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .skip_initial_state(desktop_shell::LAUNCHER_WINDOW_LABEL)
+                .with_filter(|label| label != desktop_shell::LAUNCHER_WINDOW_LABEL)
                 .build(),
         )
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -3022,19 +2456,9 @@ pub fn run() {
                 )
                 .build(),
         )
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-            }
-        })
+        .on_window_event(desktop_shell::handle_window_event)
         .setup(|app| {
-            app.manage(MainWindowReopenGuard::default());
-            setup_tray(app)?;
-            setup_launcher_window(app)?;
-            let _ = setup_global_shortcut(app);
+            desktop_shell::setup(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3057,9 +2481,7 @@ pub fn run() {
         .expect("failed to build DevForge")
         .run(|app, event| {
             if let tauri::RunEvent::Reopen { .. } = event {
-                if !app.state::<MainWindowReopenGuard>().consume_if_active() {
-                    show_main_window(app);
-                }
+                desktop_shell::handle_reopen(app);
             }
         });
 }
@@ -3109,173 +2531,6 @@ mod tests {
         assert_eq!(entry.display_path, "/Applications/Safari.app");
         assert_eq!(entry.source, "filesystem");
         assert!(entry.aliases.contains(&"Safari".to_string()));
-    }
-
-    #[test]
-    fn main_window_reopen_guard_suppresses_once_within_duration() {
-        let guard = MainWindowReopenGuard::default();
-
-        guard.suppress_for(Duration::from_secs(2));
-
-        assert!(guard.consume_if_active());
-        assert!(!guard.consume_if_active());
-    }
-
-    #[test]
-    fn main_window_reopen_guard_does_not_suppress_after_expiration() {
-        let guard = MainWindowReopenGuard::default();
-        let now = Instant::now();
-
-        {
-            let mut suppress_until = guard.suppress_until.lock().expect("guard lock");
-            *suppress_until = Some(now - Duration::from_millis(1));
-        }
-
-        assert!(!guard.consume_if_active_at(now));
-        assert!(!guard.consume_if_active_at(now));
-    }
-
-    #[test]
-    fn centers_launcher_on_primary_monitor() {
-        let frame = LauncherMonitorFrame {
-            x: 0.0,
-            y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
-        };
-
-        let position = launcher_position_for_monitor_frame(
-            frame,
-            LAUNCHER_WINDOW_WIDTH,
-            LAUNCHER_WINDOW_HEIGHT,
-        );
-
-        assert_eq!(position.x, 570.0);
-        assert_eq!(position.y, 295.0);
-    }
-
-    #[test]
-    fn centers_launcher_on_left_secondary_monitor() {
-        let frame = LauncherMonitorFrame {
-            x: -1920.0,
-            y: 0.0,
-            width: 1920.0,
-            height: 1080.0,
-        };
-
-        let position = launcher_position_for_monitor_frame(
-            frame,
-            LAUNCHER_WINDOW_WIDTH,
-            LAUNCHER_WINDOW_HEIGHT,
-        );
-
-        assert_eq!(position.x, -1350.0);
-        assert_eq!(position.y, 295.0);
-    }
-
-    #[test]
-    fn centers_launcher_on_upper_monitor() {
-        let frame = LauncherMonitorFrame {
-            x: 0.0,
-            y: 1080.0,
-            width: 1920.0,
-            height: 1080.0,
-        };
-
-        let position = launcher_position_for_monitor_frame(
-            frame,
-            LAUNCHER_WINDOW_WIDTH,
-            LAUNCHER_WINDOW_HEIGHT,
-        );
-
-        assert_eq!(position.x, 570.0);
-        assert_eq!(position.y, 1375.0);
-    }
-
-    #[test]
-    fn centers_launcher_on_lower_monitor() {
-        let frame = LauncherMonitorFrame {
-            x: 0.0,
-            y: -900.0,
-            width: 1600.0,
-            height: 900.0,
-        };
-
-        let position = launcher_position_for_monitor_frame(
-            frame,
-            LAUNCHER_WINDOW_WIDTH,
-            LAUNCHER_WINDOW_HEIGHT,
-        );
-
-        assert_eq!(position.x, 410.0);
-        assert_eq!(position.y, -695.0);
-    }
-
-    #[test]
-    fn clamps_launcher_position_inside_small_monitor() {
-        let frame = LauncherMonitorFrame {
-            x: 100.0,
-            y: 50.0,
-            width: 640.0,
-            height: 400.0,
-        };
-
-        let position = launcher_position_for_monitor_frame(
-            frame,
-            LAUNCHER_WINDOW_WIDTH,
-            LAUNCHER_WINDOW_HEIGHT,
-        );
-
-        assert_eq!(position.x, 100.0);
-        assert_eq!(position.y, 50.0);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn launcher_fullscreen_behavior_keeps_only_valid_space_modes() {
-        let initial = NSWindowCollectionBehavior::CanJoinAllSpaces
-            | NSWindowCollectionBehavior::Managed
-            | NSWindowCollectionBehavior::Stationary
-            | NSWindowCollectionBehavior::FullScreenPrimary
-            | NSWindowCollectionBehavior::FullScreenNone;
-
-        let behavior = launcher_fullscreen_collection_behavior(initial);
-
-        assert!(behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces));
-        assert!(behavior.contains(NSWindowCollectionBehavior::Auxiliary));
-        assert!(behavior.contains(NSWindowCollectionBehavior::Transient));
-        assert!(behavior.contains(NSWindowCollectionBehavior::FullScreenAuxiliary));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::MoveToActiveSpace));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::Primary));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::CanJoinAllApplications));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::Managed));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::Stationary));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::FullScreenPrimary));
-        assert!(!behavior.contains(NSWindowCollectionBehavior::FullScreenNone));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn launcher_activation_options_force_foreground_activation() {
-        let options = launcher_activation_options();
-
-        assert!(options.contains(NSApplicationActivationOptions::ActivateAllWindows));
-        #[allow(deprecated)]
-        {
-            assert!(options.contains(NSApplicationActivationOptions::ActivateIgnoringOtherApps));
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn launcher_style_mask_stays_focusable() {
-        let style_mask = launcher_floating_panel_style_mask(
-            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
-        );
-
-        assert!(style_mask.contains(NSWindowStyleMask::UtilityWindow));
-        assert!(!style_mask.contains(NSWindowStyleMask::NonactivatingPanel));
-        assert!(!style_mask.contains(NSWindowStyleMask::Miniaturizable));
     }
 
     #[test]
