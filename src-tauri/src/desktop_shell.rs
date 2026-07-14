@@ -4,9 +4,9 @@ use block2::RcBlock;
 use objc2::{exception, runtime::AnyObject, MainThreadMarker};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSApplicationDidResignActiveNotification,
-    NSEvent, NSFloatingWindowLevel, NSPopUpMenuWindowLevel, NSRunningApplication, NSScreen,
-    NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSApplicationDidResignActiveNotification, NSEvent, NSFloatingWindowLevel,
+    NSPopUpMenuWindowLevel, NSScreen, NSWindow, NSWindowAnimationBehavior,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSNotificationCenter, NSPoint, NSPointInRect, NSRect, NSSize};
@@ -135,8 +135,18 @@ impl MainWindowReopenGuard {
 }
 
 #[cfg(target_os = "macos")]
-fn launcher_activation_options() -> NSApplicationActivationOptions {
-    NSApplicationActivationOptions::empty()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherActivationStep {
+    MakeWindowKey,
+    ActivateApplication,
+}
+
+#[cfg(target_os = "macos")]
+fn launcher_activation_steps() -> [LauncherActivationStep; 2] {
+    [
+        LauncherActivationStep::MakeWindowKey,
+        LauncherActivationStep::ActivateApplication,
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -833,14 +843,20 @@ fn show_and_front_launcher<R: Runtime>(window: &WebviewWindow<R>) -> Result<(), 
                 ns_window.deminiaturize(None::<&AnyObject>);
             }
             ns_window.orderFrontRegardless();
-            activate_current_macos_app();
-            if ns_window.canBecomeKeyWindow() {
-                ns_window.makeKeyWindow();
+            for step in launcher_activation_steps() {
+                match step {
+                    LauncherActivationStep::MakeWindowKey => {
+                        if ns_window.canBecomeKeyWindow() {
+                            ns_window.makeKeyWindow();
+                        }
+                        if ns_window.canBecomeMainWindow() {
+                            ns_window.makeMainWindow();
+                        }
+                        ns_window.makeKeyAndOrderFront(None::<&AnyObject>);
+                    }
+                    LauncherActivationStep::ActivateApplication => activate_current_macos_app(),
+                }
             }
-            if ns_window.canBecomeMainWindow() {
-                ns_window.makeMainWindow();
-            }
-            ns_window.makeKeyAndOrderFront(None::<&AnyObject>);
             ns_window.orderFrontRegardless();
         })?;
     }
@@ -878,10 +894,6 @@ fn activate_current_macos_app() {
     };
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
-    let running_app = NSRunningApplication::currentApplication();
-    if !running_app.activateWithOptions(launcher_activation_options()) {
-        log_launcher_debug("activate current application returned false");
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1100,9 +1112,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn launcher_activation_does_not_bring_all_app_windows_forward() {
-        let options = launcher_activation_options();
-
-        assert!(!options.contains(NSApplicationActivationOptions::ActivateAllWindows));
+        assert_eq!(
+            launcher_activation_steps(),
+            [
+                LauncherActivationStep::MakeWindowKey,
+                LauncherActivationStep::ActivateApplication,
+            ]
+        );
     }
 
     #[cfg(target_os = "macos")]
